@@ -10,3 +10,5 @@ authors = ["Google LLC"]
 [dependencies]
 object = { version = "0.28", features = ["write"] }
 humansize = "2.0"
+clap = { version = "4.2.7", features = ["derive"] }
+owo-colors = { version = "3.5.0", features = ["supports-colors"] }

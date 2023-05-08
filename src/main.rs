@@ -1,6 +1,24 @@
+use std::path::PathBuf;
+use std::process::ExitCode;
+
+use clap::{CommandFactory, Parser};
 use humansize::{format_size, BINARY};
 use object::elf;
 use object::{Object, ObjectSection, ObjectSegment, SegmentFlags};
+
+#[derive(Parser, Debug)]
+#[command(version, about, long_about = None)]
+struct Args {
+    #[arg(long)]
+    fixed_only: bool,
+    #[arg(long)]
+    total_mem_limit: Option<String>,
+    #[arg(long)]
+    data_mem_limit: Option<String>,
+    #[arg(long)]
+    instruction_mem_limit: Option<String>,
+    files: Vec<PathBuf>,
+}
 
 pub type Addr = u64;
 
@@ -48,9 +66,61 @@ impl SizeSummary {
         }
     }
 
+    pub fn total(&self) -> u64 {
+        self.instruction_memory + self.data_memory_total
+    }
+
     pub fn total_fixed(&self) -> u64 {
         self.instruction_memory + self.data_memory_fixed()
     }
+
+    pub fn limit_summary(
+        &self,
+        total_limit: Option<u64>,
+        instruction_limit: Option<u64>,
+        data_limit: Option<u64>,
+    ) -> LimitSummary {
+        LimitSummary {
+            total_limit: total_limit.map(|limit| percent(self.total(), limit)),
+            total_fixed_limit: total_limit.map(|limit| percent(self.total_fixed(), limit)),
+            instruction_limit: instruction_limit
+                .map(|limit| percent(self.instruction_memory, limit)),
+            data_limit: data_limit.map(|limit| percent(self.data_memory_total, limit)),
+            data_fixed_limit: data_limit.map(|limit| percent(self.data_memory_fixed(), limit)),
+        }
+    }
+}
+
+pub struct LimitSummary {
+    pub total_limit: Option<u64>,
+    pub total_fixed_limit: Option<u64>,
+    pub instruction_limit: Option<u64>,
+    pub data_limit: Option<u64>,
+    pub data_fixed_limit: Option<u64>,
+}
+
+impl LimitSummary {
+    pub fn any_over_100_percent(&self, fixed_only: bool) -> bool {
+        fn over(opt: Option<u64>) -> bool {
+            opt.map(|x| x > 100).unwrap_or(false)
+        }
+
+        if fixed_only {
+            over(self.total_fixed_limit)
+                || over(self.instruction_limit)
+                || over(self.data_fixed_limit)
+        } else {
+            over(self.total_limit)
+                || over(self.total_fixed_limit)
+                || over(self.instruction_limit)
+                || over(self.data_limit)
+                || over(self.data_fixed_limit)
+        }
+    }
+}
+
+fn percent(val: u64, of: u64) -> u64 {
+    ((val as f64 / of as f64) * 100.0) as u64
 }
 
 /// Reads in an ELF from bytes.
@@ -137,8 +207,8 @@ fn size_summary(binary: &[u8]) -> Result<SizeSummary, object::Error> {
     Ok(summary)
 }
 
-fn print_summaries(summaries: impl IntoIterator<Item = (String, SizeSummary)>, _options: ()) {
-    for (i, (path, summary)) in summaries.into_iter().enumerate() {
+fn print_summaries(summaries: &[(PathBuf, SizeSummary, LimitSummary)], fixed_only: bool) {
+    for (i, (path, summary, limits)) in summaries.iter().enumerate() {
         // shorter name for "human size", also handles some padding for units
         let hs = |x| {
             let s = format_size(x, BINARY);
@@ -150,67 +220,203 @@ fn print_summaries(summaries: impl IntoIterator<Item = (String, SizeSummary)>, _
             format!("{num} {unit:>3}")
         };
 
+        let lim = |limit| {
+            use owo_colors::{OwoColorize, Stream::Stdout};
+
+            if let Some(lim) = limit {
+                let percent = format!("({lim:>3}%)");
+                let text = if lim < 75 {
+                    percent
+                        .if_supports_color(Stdout, |text| text.green())
+                        .to_string()
+                } else if lim <= 100 {
+                    percent
+                        .if_supports_color(Stdout, |text| text.yellow())
+                        .to_string()
+                } else {
+                    percent
+                        .if_supports_color(Stdout, |text| text.red())
+                        .to_string()
+                };
+                format!(" {}", text)
+            } else {
+                "".to_string()
+            }
+        };
+
         if i > 0 {
             println!();
         }
 
-        println!("File: {path}");
+        println!("File: {}", path.display());
         println!(
-            "  Instruction memory: {:>10}",
-            hs(summary.instruction_memory)
-        );
-        println!(
-            "  Data memory:        {:>10}",
-            hs(summary.data_memory_total)
+            "  Instruction memory: {:>10}{}",
+            hs(summary.instruction_memory),
+            lim(limits.instruction_limit)
         );
 
-        if let Some(data_dynamic) = summary.data_memory_dynamic() {
+        if fixed_only {
             println!(
-                "    Fixed:            {:>10}",
-                hs(summary.data_memory_fixed())
+                "  Data memory fixed:  {:>10}{}",
+                hs(summary.data_memory_fixed()),
+                lim(limits.data_fixed_limit)
             );
-            match (summary.data_memory_stack, summary.data_memory_heap) {
-                (Some(s), Some(h)) => {
-                    println!("    Dynamic:          {:>10}", hs(data_dynamic));
-                    println!("      Stack:          {:>10}", hs(s));
-                    println!("      Heap:           {:>10}", hs(h));
-                }
-                (Some(s), None) => {
-                    println!("    Stack:            {:>10}", hs(s));
-                }
-                (None, Some(h)) => {
-                    println!("    Heap:             {:>10}", hs(h));
-                }
-                _ => {}
-            }
-        }
 
-        println!(
-            "  Total memory:       {:>10}",
-            hs(summary.instruction_memory + summary.data_memory_total)
-        );
-        if let Some(data_dynamic) = summary.data_memory_dynamic() {
-            println!("    Fixed:            {:>10}", hs(summary.total_fixed()));
-            println!("    Dynamic:          {:>10}", hs(data_dynamic));
+            println!(
+                "  Total memory fixed: {:>10}{}",
+                hs(summary.total_fixed()),
+                lim(limits.total_fixed_limit)
+            );
+        } else {
+            println!(
+                "  Data memory:        {:>10}{}",
+                hs(summary.data_memory_total),
+                lim(limits.data_limit)
+            );
+
+            if let Some(data_dynamic) = summary.data_memory_dynamic() {
+                println!(
+                    "    Fixed:            {:>10}{}",
+                    hs(summary.data_memory_fixed()),
+                    lim(limits.data_fixed_limit)
+                );
+
+                match (summary.data_memory_stack, summary.data_memory_heap) {
+                    (Some(s), Some(h)) => {
+                        println!("    Dynamic:          {:>10}", hs(data_dynamic));
+                        println!("      Stack:          {:>10}", hs(s));
+                        println!("      Heap:           {:>10}", hs(h));
+                    }
+                    (Some(s), None) => {
+                        println!("    Stack:            {:>10}", hs(s));
+                    }
+                    (None, Some(h)) => {
+                        println!("    Heap:             {:>10}", hs(h));
+                    }
+                    _ => {}
+                }
+            }
+
+            println!(
+                "  Total memory:       {:>10}{}",
+                hs(summary.instruction_memory + summary.data_memory_total),
+                lim(limits.total_limit)
+            );
+
+            if let Some(data_dynamic) = summary.data_memory_dynamic() {
+                println!(
+                    "    Fixed:            {:>10}{}",
+                    hs(summary.total_fixed()),
+                    lim(limits.total_fixed_limit)
+                );
+
+                println!("    Dynamic:          {:>10}", hs(data_dynamic));
+            }
         }
     }
 }
 
-fn main() {
-    let args = std::env::args().skip(1).collect::<Vec<_>>();
+fn parse_limit(s: &str) -> Result<u64, String> {
+    let s = s.to_ascii_lowercase();
 
-    if args.is_empty() {
-        println!("Please provide one or more paths to ELF binaries as arguments.");
-        return;
+    let (num_part, unit_value) = if let Some(num) = s.strip_suffix("tb") {
+        (num.trim(), 1000 * 1000 * 1000 * 1000)
+    } else if let Some(num) = s.strip_suffix("tib") {
+        (num.trim(), 1024 * 1024 * 1024 * 1024)
+    } else if let Some(num) = s.strip_suffix('t') {
+        (num.trim(), 1024 * 1024 * 1024 * 1024)
+    } else if let Some(num) = s.strip_suffix("gb") {
+        (num.trim(), 1000 * 1000 * 1000)
+    } else if let Some(num) = s.strip_suffix("gib") {
+        (num.trim(), 1024 * 1024 * 1024)
+    } else if let Some(num) = s.strip_suffix('g') {
+        (num.trim(), 1024 * 1024 * 1024)
+    } else if let Some(num) = s.strip_suffix("mb") {
+        (num.trim(), 1000 * 1000)
+    } else if let Some(num) = s.strip_suffix("mib") {
+        (num.trim(), 1024 * 1024)
+    } else if let Some(num) = s.strip_suffix('m') {
+        (num.trim(), 1024 * 1024)
+    } else if let Some(num) = s.strip_suffix("kb") {
+        (num.trim(), 1000)
+    } else if let Some(num) = s.strip_suffix("kib") {
+        (num.trim(), 1024)
+    } else if let Some(num) = s.strip_suffix('k') {
+        (num.trim(), 1024)
+    } else if let Some(num) = s.strip_suffix('b') {
+        (num.trim(), 1)
+    } else if s.trim().chars().all(|c| c.is_numeric()) {
+        (s.trim(), 1)
+    } else {
+        return Err(
+            "limit must be a number followed by an optional SI unit (GiB, KB, etc)".to_string(),
+        );
+    };
+
+    match num_part.parse::<u64>() {
+        Ok(num) => Ok(num * unit_value),
+        Err(err) => Err(format!(
+            "limit must be a number followed by an optional SI unit (GiB, KB, etc). {err}"
+        )),
     }
+}
+
+fn main() -> ExitCode {
+    let args = Args::parse();
+
+    let total_limit = if let Some(limit) = args.total_mem_limit {
+        match parse_limit(&limit) {
+            Ok(val) => Some(val),
+            Err(err) => {
+                let mut cmd = Args::command();
+                cmd.error(
+                    clap::error::ErrorKind::ValueValidation,
+                    format!("--total-mem-limit value validation error: {err}"),
+                )
+                .exit()
+            }
+        }
+    } else {
+        None
+    };
+    let instruction_limit = if let Some(limit) = args.instruction_mem_limit {
+        match parse_limit(&limit) {
+            Ok(val) => Some(val),
+            Err(err) => {
+                let mut cmd = Args::command();
+                cmd.error(
+                    clap::error::ErrorKind::ValueValidation,
+                    format!("--instruction-mem-limit value validation error: {err}"),
+                )
+                .exit()
+            }
+        }
+    } else {
+        None
+    };
+    let data_limit = if let Some(limit) = args.data_mem_limit {
+        match parse_limit(&limit) {
+            Ok(val) => Some(val),
+            Err(err) => {
+                let mut cmd = Args::command();
+                cmd.error(
+                    clap::error::ErrorKind::ValueValidation,
+                    format!("--data-mem-limit value validation error: {err}"),
+                )
+                .exit()
+            }
+        }
+    } else {
+        None
+    };
 
     let mut summaries = vec![];
 
-    for path in args {
-        let contents = match std::fs::read(&path) {
+    for path in &args.files {
+        let contents = match std::fs::read(path) {
             Ok(val) => val,
             Err(err) => {
-                eprintln!("Could not read file {path}: {err}");
+                eprintln!("Could not read file {}: {err}", path.display());
                 continue;
             }
         };
@@ -218,18 +424,35 @@ fn main() {
         let summary = match size_summary(&contents) {
             Ok(val) => val,
             Err(err) => {
-                eprintln!("Error reading ELF binary {path}: {err}");
+                eprintln!("Error reading ELF binary {}: {err}", path.display());
                 continue;
             }
         };
 
-        summaries.push((path, summary));
+        let limits = summary.limit_summary(total_limit, instruction_limit, data_limit);
+
+        summaries.push((path.clone(), summary, limits));
     }
 
-    // TODO options
-    // --fixed-only
-    // --total-mem-limit X
-    // --data-mem-limit X
-    // --instr-mem-limit X
-    print_summaries(summaries, ());
+    print_summaries(summaries.as_slice(), args.fixed_only);
+
+    let mut any_over_limit = false;
+
+    for (i, (path, _, lim)) in summaries.into_iter().enumerate() {
+        if lim.any_over_100_percent(args.fixed_only) {
+            any_over_limit = true;
+
+            if i == 0 {
+                println!();
+            }
+
+            println!("File {} exceeds memory limits", path.display());
+        }
+    }
+
+    if any_over_limit {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    }
 }
