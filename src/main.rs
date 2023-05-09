@@ -9,12 +9,16 @@ use object::{Object, ObjectSection, ObjectSegment, SegmentFlags};
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
 struct Args {
+    /// Only consider fixed memory for calculations
     #[arg(long)]
     fixed_only: bool,
+    /// Limit for total memory usage (respects `--fixed-only`)
     #[arg(long)]
     total_mem_limit: Option<String>,
+    /// Limit for data memory usage (respects `--fixed-only`)
     #[arg(long)]
     data_mem_limit: Option<String>,
+    /// Limit for instruction memory usage
     #[arg(long)]
     instruction_mem_limit: Option<String>,
     files: Vec<PathBuf>,
